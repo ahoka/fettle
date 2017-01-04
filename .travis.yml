@@ -10,3 +10,4 @@ deploy:
   file: fettle
   on:
     repo: ahoka/fettle
+    tags: true
