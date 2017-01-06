@@ -1,7 +1,7 @@
 package main
 
-import "github.com/ahoka/fettle/lib"
+import "github.com/ahoka/fettle/server"
 
 func main() {
-	lib.Start()
+	server.Start()
 }

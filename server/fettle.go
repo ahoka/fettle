@@ -4,10 +4,19 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"github.com/google/uuid"
 )
 
 type response struct {
 	Message string
+}
+
+type Instance struct {
+	Id UUID
+}
+
+func NewInstance() {
+	return Instance{uuid.New()}
 }
 
 // Start fettle

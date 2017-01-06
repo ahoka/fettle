@@ -1,6 +1,8 @@
 all: fettle
 
-fettle:
+SRC=$(shell find . -name '*.go')
+
+fettle: $(SRC)
 	go build
 
 .PHONY: test
