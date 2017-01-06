@@ -39,7 +39,7 @@ func writeResponse(w http.ResponseWriter, message string, code int) {
 	json.NewEncoder(w).Encode(response{message})
 }
 
-func (ins *Instance) register(url.URL) {
+func (ins *Instance) register() error {
 	config := api.DefaultConfig()
 	config.Address = ins.ConsulAddress.Host
 	client, err := api.NewClient(config)
@@ -67,7 +67,9 @@ func (ins *Instance) register(url.URL) {
 		},
 	}
 
-	client.Agent().ServiceRegister(reg)
+	log.Println("Registering service")
+
+	return client.Agent().ServiceRegister(reg)
 }
 
 func getEnv(key string, def string) string {
@@ -79,19 +81,46 @@ func getEnv(key string, def string) string {
 	return value
 }
 
+func getEnvRequired(key string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		log.Panicln("Required configuration missing:", key)
+	}
+
+	return value
+}
+
+func getEnvRequiredURL(key string) *url.URL {
+	v := getEnvRequired(key)
+
+	ret, err := url.Parse(v)
+	if err != nil {
+		log.Panicln("Required configuration is not a valid URL:", key)
+	}
+
+	return ret
+}
+
 // Start fettle
 func Start() {
-	consulAddress, err := url.Parse(getEnv("FETTLE_CONSUL_ADDRESS", "http://0.0.0.0:8500"))
+	consulAddress, err := url.Parse(getEnv("FETTLE_CONSUL_ADDRESS", "http://127.0.0.1:8500"))
 	if err != nil {
 		log.Panicln("Invalid FETTLE_CONSUL_ADDRESS")
 	}
 
-	instance := NewInstance(*consulAddress)
+	instance := NewInstance(getEnvRequired("FETTLE_SERVICE_NAME"),
+		*consulAddress,
+		*getEnvRequiredURL("FETTLE_SERVICE_URL"))
 
 	fettleAddress := getEnv("FETTLE_ADDRESS", "0.0.0.0")
 	fettlePort := getEnv("FETTLE_PORT", "8099")
 
 	log.Println("Starting new fettle instance with id", instance.ID)
+
+	err = instance.register()
+	if err != nil {
+		log.Println("Cannot register:", err)
+	}
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		log.Println("Req: ", r.URL)
