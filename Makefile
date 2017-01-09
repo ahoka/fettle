@@ -7,8 +7,9 @@ fettle: $(SRC)
 	go get github.com/hashicorp/consul/api
 	go get github.com/google/uuid
 	go get github.com/jinzhu/configor
-	env CGO_ENABLED=0 go build
+	env CGO_ENABLED=0 go build -ldflags="-s -w"
 	@file fettle
+	@du -h fettle
 
 .PHONY: test
 test: fettle
