@@ -1,0 +1,18 @@
+service:
+    name:       Fettle
+    address:    http://localhost:8099
+
+consul:
+    address:    http://localhost:8500
+    tags:
+        - "version:1.0"
+        - "primary"
+    health:
+        interval: 1s
+        deregister: 10s
+
+supervisor:
+    - name:     ping
+      command:  ping -t 127.0.0.1
+    - name:     google
+      command:  ping -t google.com -n 10

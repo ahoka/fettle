@@ -20,38 +20,85 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hashicorp/consul/api"
+	"github.com/jinzhu/configor"
 )
 
 type response struct {
 	Message string
 }
 
+// Config holds fettle's configuration
 type Config struct {
-	FettlePort    string
-	FettleAddress string
-}
-
-func DefaultConfig() *Config {
-	conf := Config{
-		FettleAddress: getEnv("FETTLE_ADDRESS", "0.0.0.0"),
-		FettlePort:    getEnv("FETTLE_PORT", "8099"),
+	Fettle struct {
+		Port    int    `default:"8099"`
+		Address string `default:"0.0.0.0"`
 	}
 
-	return &conf
+	Consul struct {
+		Address string `default:"http://127.0.0.1:8500"`
+		Health  struct {
+			Interval   string `default:"10s"`
+			Deregister string `default:"10m"`
+		}
+		Tags []string
+	}
+
+	Service struct {
+		Name    string `required:"true"`
+		Address string `required:"true"`
+	}
+
+	Supervisor []struct {
+		Name    string `required:"true"`
+		Command string `required:"true"`
+	}
 }
 
-// Instance represents a fettel server
+// ConsulURL returns the URL for consul
+func (ins *Instance) ConsulURL() *url.URL {
+	url, err := url.Parse(ins.Conf.Consul.Address)
+	if err != nil {
+		log.Panicln("ConsulAddress is invalid:", err)
+	}
+
+	return url
+}
+
+// ServiceURL returns the public URL for the servicv
+func (ins *Instance) ServiceURL() *url.URL {
+	url, err := url.Parse(ins.Conf.Service.Address)
+	if err != nil {
+		log.Panicln("ServiceAddress is invalid:", err)
+	}
+
+	return url
+}
+
+// Instance represents a fettle server
 type Instance struct {
-	ID            uuid.UUID
-	Name          string
-	ConsulAddress url.URL
-	Address       url.URL
-	Conf          *Config
+	ID                uuid.UUID
+	Subprocesses      []Subprocess
+	SubprocessChannel chan Subprocess
+	Conf              *Config
 }
 
 // NewInstance creates a new Fettle instance
-func NewInstance(name string, consulAddress *url.URL, address *url.URL) Instance {
-	return Instance{uuid.New(), name, *consulAddress, *address, DefaultConfig()}
+func NewInstance() Instance {
+	conf := Config{}
+
+	os.Setenv("CONFIGOR_ENV_PREFIX", "FETTLE")
+	err := configor.Load(&conf, "fettle.yml")
+	if err != nil {
+		log.Fatalln("Configuration error:", err)
+	}
+
+	log.Println("Fettle Port:", conf.Fettle.Port)
+	log.Println("Fettle Address:", conf.Fettle.Address)
+	log.Println("Consul Address:", conf.Consul.Address)
+	log.Println("Service Name:", conf.Service.Address)
+	log.Println("Service Address:", conf.Service.Address)
+
+	return Instance{uuid.New(), make([]Subprocess, 0, 32), make(chan Subprocess, 1), &conf}
 }
 
 func writeResponse(w http.ResponseWriter, message string, code int) {
@@ -62,7 +109,8 @@ func writeResponse(w http.ResponseWriter, message string, code int) {
 
 // CreateCheckURL create the health check url from the service id
 func (ins *Instance) CreateCheckURL() string {
-	checkURL := ins.Address
+	checkURL := *ins.ConsulURL()
+
 	checkURL.Path = "/health"
 
 	query := checkURL.Query()
@@ -72,16 +120,23 @@ func (ins *Instance) CreateCheckURL() string {
 	return checkURL.String()
 }
 
+type Subprocess struct {
+	Name    string
+	Command string
+	Error   error
+}
+
 // RunSubprocess runs the give command and prints it's output
 // to the stdout
-func (ins *Instance) RunSubprocess(command string) chan error {
+func (ins *Instance) RunSubprocess(name string, command string) {
 	stdout := make(chan bool, 1)
 	stderr := make(chan bool, 1)
-	result := make(chan error, 1)
 
 	args := strings.Fields(command)
 
 	log.Println("Starting command:", command)
+	proc := Subprocess{Name: name, Command: command}
+	ins.Subprocesses = append(ins.Subprocesses, proc)
 
 	cmd := exec.Command(args[0], args[1:]...)
 
@@ -130,37 +185,39 @@ func (ins *Instance) RunSubprocess(command string) chan error {
 		<-stderr
 		<-stdout
 
-		result <- cmd.Wait()
-	}()
+		err := cmd.Wait()
+		proc.Error = err
 
-	return result
+		ins.SubprocessChannel <- proc
+	}()
 }
 
-func (ins *Instance) register() error {
+// Register registers the service to consul
+func (ins *Instance) Register() error {
 	config := api.DefaultConfig()
-	config.Address = ins.ConsulAddress.Host
+	config.Address = ins.ConsulURL().Host
 	client, err := api.NewClient(config)
 
 	if err != nil {
 		log.Println("Cannot connect to consul:", err.Error())
 	}
 
-	addr, portS, _ := net.SplitHostPort(ins.Address.Host)
+	addr, portS, _ := net.SplitHostPort(ins.ServiceURL().Host)
 	if portS == "" {
 		portS = "80"
 	}
 	port, _ := strconv.ParseInt(portS, 10, 0)
 
 	reg := &api.AgentServiceRegistration{
-		ID:      ins.Name + ins.ID.String(),
-		Name:    ins.Name,
+		ID:      ins.Conf.Service.Name + "-" + ins.ID.String(),
+		Name:    ins.Conf.Service.Name,
 		Address: addr,
 		Port:    int(port),
-		Tags:    []string{},
+		Tags:    ins.Conf.Consul.Tags,
 		Check: &api.AgentServiceCheck{
 			HTTP:                           ins.CreateCheckURL(),
-			Interval:                       "10s",
-			DeregisterCriticalServiceAfter: "10m",
+			Interval:                       ins.Conf.Consul.Health.Interval,
+			DeregisterCriticalServiceAfter: ins.Conf.Consul.Health.Deregister,
 		},
 	}
 
@@ -213,7 +270,7 @@ func (ins *Instance) runServer() chan error {
 		}
 	})
 
-	listenAddress := ins.Conf.FettleAddress + ":" + ins.Conf.FettlePort
+	listenAddress := ins.Conf.Fettle.Address + ":" + strconv.Itoa(ins.Conf.Fettle.Port)
 
 	result := make(chan error, 1)
 
@@ -228,25 +285,28 @@ func (ins *Instance) runServer() chan error {
 
 // Start fettle
 func Start() {
-	consulAddress, err := url.Parse(getEnv("FETTLE_CONSUL_ADDRESS", "http://127.0.0.1:8500"))
-	if err != nil {
-		log.Panicln("Invalid FETTLE_CONSUL_ADDRESS")
-	}
+	log.Println("Fettle starting up...")
+	log.Println("Using environment:", configor.ENV())
 
-	instance := NewInstance(getEnvRequired("FETTLE_SERVICE_NAME"),
-		consulAddress,
-		getEnvRequiredURL("FETTLE_SERVICE_URL"))
+	instance := NewInstance()
 
 	log.Println("Starting new fettle instance with id", instance.ID)
 
-	err = instance.register()
+	err := instance.Register()
 	if err != nil {
 		log.Println("Cannot register:", err)
 	}
 
+	for _, sup := range instance.Conf.Supervisor {
+		instance.RunSubprocess(sup.Name, sup.Command)
+	}
+
 	select {
-	case err := <-instance.RunSubprocess("ping 127.0.0.1 -n 6"):
-		log.Fatalln("Supervised process exited:", err)
+	case proc := <-instance.SubprocessChannel:
+		log.Println("Supervised process exited!")
+		log.Println("Name:", proc.Name)
+		log.Println("Command:", proc.Command)
+		log.Fatalln("Error:", proc.Error)
 	case err := <-instance.runServer():
 		log.Panicln("HTTP server exited:", err)
 	}
