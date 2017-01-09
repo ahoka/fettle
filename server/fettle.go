@@ -12,6 +12,12 @@ import (
 
 	"strconv"
 
+	"os/exec"
+	"strings"
+
+	"bufio"
+	"fmt"
+
 	"github.com/google/uuid"
 	"github.com/hashicorp/consul/api"
 )
@@ -20,17 +26,32 @@ type response struct {
 	Message string
 }
 
+type Config struct {
+	FettlePort    string
+	FettleAddress string
+}
+
+func DefaultConfig() *Config {
+	conf := Config{
+		FettleAddress: getEnv("FETTLE_ADDRESS", "0.0.0.0"),
+		FettlePort:    getEnv("FETTLE_PORT", "8099"),
+	}
+
+	return &conf
+}
+
 // Instance represents a fettel server
 type Instance struct {
 	ID            uuid.UUID
 	Name          string
 	ConsulAddress url.URL
 	Address       url.URL
+	Conf          *Config
 }
 
 // NewInstance creates a new Fettle instance
-func NewInstance(name string, consulAddress url.URL, address url.URL) Instance {
-	return Instance{uuid.New(), name, consulAddress, address}
+func NewInstance(name string, consulAddress *url.URL, address *url.URL) Instance {
+	return Instance{uuid.New(), name, *consulAddress, *address, DefaultConfig()}
 }
 
 func writeResponse(w http.ResponseWriter, message string, code int) {
@@ -39,29 +60,105 @@ func writeResponse(w http.ResponseWriter, message string, code int) {
 	json.NewEncoder(w).Encode(response{message})
 }
 
+// CreateCheckURL create the health check url from the service id
+func (ins *Instance) CreateCheckURL() string {
+	checkURL := ins.Address
+	checkURL.Path = "/health"
+
+	query := checkURL.Query()
+	query.Add("id", ins.ID.String())
+	checkURL.RawQuery = query.Encode()
+
+	return checkURL.String()
+}
+
+// RunSubprocess runs the give command and prints it's output
+// to the stdout
+func (ins *Instance) RunSubprocess(command string) chan error {
+	stdout := make(chan bool, 1)
+	stderr := make(chan bool, 1)
+	result := make(chan error, 1)
+
+	args := strings.Fields(command)
+
+	log.Println("Starting command:", command)
+
+	cmd := exec.Command(args[0], args[1:]...)
+
+	go func() {
+		pipe, err := cmd.StderrPipe()
+		if err != nil {
+			log.Panicln("Error opening stderr pipe", err)
+		}
+
+		stderr <- true
+
+		scanner := bufio.NewScanner(pipe)
+
+		for scanner.Scan() {
+			fmt.Println(scanner.Text())
+		}
+
+		stderr <- true
+	}()
+
+	go func() {
+		pipe, err := cmd.StdoutPipe()
+		if err != nil {
+			log.Panicln("Error opening stdout pipe", err)
+		}
+
+		stdout <- true
+
+		scanner := bufio.NewScanner(pipe)
+
+		for scanner.Scan() {
+			fmt.Println(scanner.Text())
+		}
+
+		stdout <- true
+	}()
+
+	<-stderr
+	<-stdout
+	err := cmd.Start()
+	if err != nil {
+		log.Panicln("Cannot start command:", command, ", Error:", err)
+	}
+
+	go func() {
+		<-stderr
+		<-stdout
+
+		result <- cmd.Wait()
+	}()
+
+	return result
+}
+
 func (ins *Instance) register() error {
 	config := api.DefaultConfig()
 	config.Address = ins.ConsulAddress.Host
 	client, err := api.NewClient(config)
+
 	if err != nil {
 		log.Println("Cannot connect to consul:", err.Error())
 	}
 
-	checkURL := ins.Address
-	checkURL.Path = "/health"
-	checkURL.Query().Set("id", ins.ID.String())
-
 	addr, portS, _ := net.SplitHostPort(ins.Address.Host)
+	if portS == "" {
+		portS = "80"
+	}
 	port, _ := strconv.ParseInt(portS, 10, 0)
 
 	reg := &api.AgentServiceRegistration{
-		ID:      ins.ID.String(),
-		Name:    ins.Name + "-" + ins.ID.String(),
+		ID:      ins.Name + ins.ID.String(),
+		Name:    ins.Name,
 		Address: addr,
 		Port:    int(port),
 		Tags:    []string{},
 		Check: &api.AgentServiceCheck{
-			HTTP:                           checkURL.String(),
+			HTTP:                           ins.CreateCheckURL(),
 			Interval:                       "10s",
 			DeregisterCriticalServiceAfter: "10m",
 		},
@@ -101,6 +198,34 @@ func getEnvRequiredURL(key string) *url.URL {
 	return ret
 }
 
+func (ins *Instance) runServer() chan error {
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		id, present := r.URL.Query()["id"]
+		if present {
+			uuid, err := uuid.Parse(id[0])
+			if err != nil || uuid != ins.ID {
+				writeResponse(w, "Mismatch", 404)
+			} else {
+				writeResponse(w, "OK", 200)
+			}
+		} else {
+			writeResponse(w, "Mismatch", 404)
+		}
+	})
+
+	listenAddress := ins.Conf.FettleAddress + ":" + ins.Conf.FettlePort
+
+	result := make(chan error, 1)
+
+	go func() {
+		log.Println("Listening on", listenAddress)
+		err := http.ListenAndServe(listenAddress, nil)
+		result <- err
+	}()
+
+	return result
+}
+
 // Start fettle
 func Start() {
 	consulAddress, err := url.Parse(getEnv("FETTLE_CONSUL_ADDRESS", "http://127.0.0.1:8500"))
@@ -109,11 +234,8 @@ func Start() {
 	}
 
 	instance := NewInstance(getEnvRequired("FETTLE_SERVICE_NAME"),
-		*consulAddress,
-		*getEnvRequiredURL("FETTLE_SERVICE_URL"))
-
-	fettleAddress := getEnv("FETTLE_ADDRESS", "0.0.0.0")
-	fettlePort := getEnv("FETTLE_PORT", "8099")
+		consulAddress,
+		getEnvRequiredURL("FETTLE_SERVICE_URL"))
 
 	log.Println("Starting new fettle instance with id", instance.ID)
 
@@ -122,27 +244,10 @@ func Start() {
 		log.Println("Cannot register:", err)
 	}
 
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		log.Println("Req: ", r.URL)
-
-		id, present := r.URL.Query()["id"]
-		if present {
-			log.Println("Got id: ", id[0])
-
-			uuid, err := uuid.Parse(id[0])
-			if err != nil || uuid != instance.ID {
-				log.Println("Invalid Id, rejecting")
-				writeResponse(w, "Mismatch", 404)
-			} else {
-				writeResponse(w, "OK", 200)
-			}
-		} else {
-			log.Println("No Id present, rejecting")
-			writeResponse(w, "Mismatch", 404)
-		}
-	})
-
-	listenAddress := fettleAddress + ":" + fettlePort
-	log.Println("Listening on", listenAddress)
-	log.Fatal(http.ListenAndServe(listenAddress, nil))
+	select {
+	case err := <-instance.RunSubprocess("ping 127.0.0.1 -n 6"):
+		log.Fatalln("Supervised process exited:", err)
+	case err := <-instance.runServer():
+		log.Panicln("HTTP server exited:", err)
+	}
 }
