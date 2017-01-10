@@ -1,6 +1,6 @@
 service:
     name:       Fettle
-    address:    http://localhost:8099
+    address:    http://localhost:8080
 
 consul:
     address:    http://localhost:8500
@@ -8,6 +8,7 @@ consul:
         - "version:1.0"
         - "primary"
     health:
+        address: http://localhost:8099
         interval: 1s
         deregister: 10s
     interval: 15s

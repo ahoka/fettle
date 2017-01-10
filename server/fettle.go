@@ -41,6 +41,7 @@ type Config struct {
 		Health  struct {
 			Interval   string `default:"10s"`
 			Deregister string `default:"10m"`
+			Address    string
 		}
 		Interval string `default:"30s"`
 		Tags     []string
@@ -112,7 +113,18 @@ func writeResponse(w http.ResponseWriter, message string, code int) {
 
 // CreateCheckURL create the health check url from the service id
 func (ins *Instance) CreateCheckURL() string {
-	checkURL := *ins.ServiceURL()
+	var checkURL *url.URL
+
+	addr := ins.Conf.Consul.Health.Address
+	if addr == "" {
+		*checkURL = *ins.ServiceURL()
+	} else {
+		var err error
+		checkURL, err = url.Parse(addr)
+		if err != nil {
+			log.Panicln("Health URL is invalid:", err)
+		}
+	}
 
 	checkURL.Path = "/health"
 
