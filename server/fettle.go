@@ -113,17 +113,17 @@ func writeResponse(w http.ResponseWriter, message string, code int) {
 
 // CreateCheckURL create the health check url from the service id
 func (ins *Instance) CreateCheckURL() string {
-	var checkURL *url.URL
+	var checkURL url.URL
 
 	addr := ins.Conf.Consul.Health.Address
 	if addr == "" {
-		*checkURL = *ins.ServiceURL()
+		checkURL = *ins.ServiceURL()
 	} else {
-		var err error
-		checkURL, err = url.Parse(addr)
+		url, err := url.Parse(addr)
 		if err != nil {
 			log.Panicln("Health URL is invalid:", err)
 		}
+		checkURL = *url
 	}
 
 	checkURL.Path = "/health"
