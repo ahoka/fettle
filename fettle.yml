@@ -10,6 +10,7 @@ consul:
     health:
         interval: 1s
         deregister: 10s
+    interval: 15s
 
 supervisor:
     - name:     ping

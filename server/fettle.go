@@ -18,6 +18,8 @@ import (
 	"bufio"
 	"fmt"
 
+	"time"
+
 	"github.com/google/uuid"
 	"github.com/hashicorp/consul/api"
 	"github.com/jinzhu/configor"
@@ -40,7 +42,8 @@ type Config struct {
 			Interval   string `default:"10s"`
 			Deregister string `default:"10m"`
 		}
-		Tags []string
+		Interval string `default:"30s"`
+		Tags     []string
 	}
 
 	Service struct {
@@ -193,37 +196,47 @@ func (ins *Instance) RunSubprocess(name string, command string) {
 }
 
 // Register registers the service to consul
-func (ins *Instance) Register() error {
-	config := api.DefaultConfig()
-	config.Address = ins.ConsulURL().Host
-	client, err := api.NewClient(config)
-
-	if err != nil {
-		log.Println("Cannot connect to consul:", err.Error())
-	}
-
+func (ins *Instance) Register() {
 	addr, portS, _ := net.SplitHostPort(ins.ServiceURL().Host)
 	if portS == "" {
 		portS = "80"
 	}
 	port, _ := strconv.ParseInt(portS, 10, 0)
+	config := api.DefaultConfig()
+	config.Address = ins.ConsulURL().Host
 
-	reg := &api.AgentServiceRegistration{
-		ID:      ins.Conf.Service.Name + "-" + ins.ID.String(),
-		Name:    ins.Conf.Service.Name,
-		Address: addr,
-		Port:    int(port),
-		Tags:    ins.Conf.Consul.Tags,
-		Check: &api.AgentServiceCheck{
-			HTTP:                           ins.CreateCheckURL(),
-			Interval:                       ins.Conf.Consul.Health.Interval,
-			DeregisterCriticalServiceAfter: ins.Conf.Consul.Health.Deregister,
-		},
+	interval, err := time.ParseDuration(ins.Conf.Consul.Interval)
+	if err != nil {
+		log.Panicln("Invalid Consul interval:", err)
 	}
 
-	log.Println("Registering service")
+	for {
+		client, err := api.NewClient(config)
 
-	return client.Agent().ServiceRegister(reg)
+		if err != nil {
+			log.Println("Cannot connect to Consul:", err)
+		} else {
+			reg := &api.AgentServiceRegistration{
+				ID:      ins.Conf.Service.Name + "-" + ins.ID.String(),
+				Name:    ins.Conf.Service.Name,
+				Address: addr,
+				Port:    int(port),
+				Tags:    ins.Conf.Consul.Tags,
+				Check: &api.AgentServiceCheck{
+					HTTP:                           ins.CreateCheckURL(),
+					Interval:                       ins.Conf.Consul.Health.Interval,
+					DeregisterCriticalServiceAfter: ins.Conf.Consul.Health.Deregister,
+				},
+			}
+
+			err = client.Agent().ServiceRegister(reg)
+			if err != nil {
+				log.Println("Cannot register to Consul:", err)
+			}
+		}
+
+		time.Sleep(interval)
+	}
 }
 
 func getEnv(key string, def string) string {
@@ -255,7 +268,7 @@ func getEnvRequiredURL(key string) *url.URL {
 	return ret
 }
 
-func (ins *Instance) runServer() chan error {
+func (ins *Instance) RunServer() chan error {
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		id, present := r.URL.Query()["id"]
 		if present {
@@ -292,14 +305,12 @@ func Start() {
 
 	log.Println("Starting new fettle instance with id", instance.ID)
 
-	err := instance.Register()
-	if err != nil {
-		log.Println("Cannot register:", err)
-	}
-
 	for _, sup := range instance.Conf.Supervisor {
 		instance.RunSubprocess(sup.Name, sup.Command)
 	}
+
+	servChan := instance.RunServer()
+	instance.Register()
 
 	select {
 	case proc := <-instance.SubprocessChannel:
@@ -307,7 +318,7 @@ func Start() {
 		log.Println("Name:", proc.Name)
 		log.Println("Command:", proc.Command)
 		log.Fatalln("Error:", proc.Error)
-	case err := <-instance.runServer():
+	case err := <-servChan:
 		log.Panicln("HTTP server exited:", err)
 	}
 }
